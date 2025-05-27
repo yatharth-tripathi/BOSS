@@ -1,74 +1,106 @@
 use anchor_lang::prelude::*;
-use anchor_lang::system_program;
-use crate::accounts::ClaimReward;
-use crate::errors::PoolError;
+use super::super::state::{Pool, Participant};
+use super::super::errors::PoolError;
 
-/// Handler for claiming rewards
+#[derive(Accounts)]
+pub struct ClaimReward<'info> {
+    /// The user claiming the reward
+    #[account(mut)]
+    pub user: Signer<'info>,
+    
+    /// The pool from which rewards are being claimed
+    #[account(
+        mut,
+        seeds = [Pool::SEEDS, pool.authority.as_ref(), pool.name.as_bytes()],
+        bump = pool.bump
+    )]
+    pub pool: Account<'info, Pool>,
+    
+    /// The participant's account
+    #[account(
+        mut,
+        seeds = [Participant::SEEDS, pool.key().as_ref(), user.key().as_ref()],
+        bump = participant.bump,
+        constraint = participant.wallet == user.key()
+    )]
+    pub participant: Account<'info, Participant>,
+    
+    /// System program for transferring SOL
+    pub system_program: Program<'info, System>,
+}
+
 pub fn handler(ctx: Context<ClaimReward>) -> Result<()> {
     let pool = &mut ctx.accounts.pool;
     let participant = &mut ctx.accounts.participant;
-    let pool_authority = &mut ctx.accounts.pool_authority;
-    let user = &mut ctx.accounts.user;
-    let system_program = &ctx.accounts.system_program;
 
-    // Check if participant has already claimed
+    // Check if participant has already claimed rewards
     if participant.has_claimed {
-        return Err(PoolError::AlreadyClaimed.into());
+        return Err(PoolError::RewardAlreadyClaimed.into());
     }
 
-    // Check if participant has a valid score
+    // Check if participant has a score
     if participant.score == 0 {
-        return Err(PoolError::ZeroScore.into());
-    }
-
-    // Check if pool has rewards available
-    if !pool.has_rewards() {
         return Err(PoolError::NoRewardsAvailable.into());
     }
 
-    // Calculate reward amount
-    let reward_amount = participant.calculate_reward(pool);
+    // Check if pool has total score to calculate rewards
+    if pool.total_score == 0 {
+        return Err(PoolError::NoRewardsAvailable.into());
+    }
+
+    // Calculate participant's share of rewards
+    // For this example, we'll distribute based on score percentage
+    // Reward = (participant_score / total_score) * pool_balance
+    let pool_balance = pool.to_account_info().lamports();
     
+    // Reserve some lamports for rent (approximately 0.002 SOL)
+    let reserved_lamports = 2_000_000u64;
+    
+    if pool_balance <= reserved_lamports {
+        return Err(PoolError::InsufficientPoolBalance.into());
+    }
+
+    let available_balance = pool_balance - reserved_lamports;
+    
+    let reward_amount = (available_balance as u128)
+        .checked_mul(participant.score as u128)
+        .ok_or(PoolError::ArithmeticOverflow)?
+        .checked_div(pool.total_score as u128)
+        .ok_or(PoolError::ArithmeticOverflow)? as u64;
+
     if reward_amount == 0 {
-        return Err(PoolError::RewardCalculationFailed.into());
+        return Err(PoolError::NoRewardsAvailable.into());
     }
 
-    // Check if pool authority has sufficient funds
-    if pool_authority.lamports() < reward_amount {
-        return Err(PoolError::InsufficientPoolFunds.into());
-    }
+    // Transfer rewards from pool to participant
+    let pool_info = pool.to_account_info();
+    let user_info = ctx.accounts.user.to_account_info();
 
-    // Transfer reward from pool authority to user
-    let transfer_instruction = system_program::Transfer {
-        from: pool_authority.to_account_info(),
-        to: user.to_account_info(),
-    };
+    **pool_info.try_borrow_mut_lamports()? = pool_info
+        .lamports()
+        .checked_sub(reward_amount)
+        .ok_or(PoolError::InsufficientPoolBalance)?;
 
-    let cpi_ctx = CpiContext::new(
-        system_program.to_account_info(),
-        transfer_instruction,
-    );
+    **user_info.try_borrow_mut_lamports()? = user_info
+        .lamports()
+        .checked_add(reward_amount)
+        .ok_or(PoolError::ArithmeticOverflow)?;
 
-    system_program::transfer(cpi_ctx, reward_amount)?;
-
-    // Update participant state
+    // Mark participant as having claimed rewards
     participant.has_claimed = true;
+    participant.rewards_claimed = reward_amount;
 
-    // Update pool statistics
-    pool.claimed_count = pool.claimed_count
-        .checked_add(1)
-        .ok_or(PoolError::MathOverflow)?;
-
-    // Update total rewards distributed
+    // Update pool total rewards distributed
     pool.total_rewards = pool.total_rewards
         .checked_add(reward_amount)
-        .ok_or(PoolError::MathOverflow)?;
+        .ok_or(PoolError::ArithmeticOverflow)?;
 
     msg!(
-        "User {} claimed reward of {} lamports from pool '{}'",
-        user.key(),
+        "User {} claimed {} lamports from pool '{}' based on score {}",
+        ctx.accounts.user.key(),
         reward_amount,
-        pool.name
+        pool.name,
+        participant.score
     );
 
     Ok(())
